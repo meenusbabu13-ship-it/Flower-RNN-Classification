@@ -1,106 +1,119 @@
 import os
-import glob
-import numpy as np
+import pathlib
 import matplotlib.pyplot as plt
-from PIL import Image
-
-from sklearn.model_selection import train_test_split
-from sklearn.metrics import classification_report, confusion_matrix, ConfusionMatrixDisplay
+import numpy as np
+from sklearn.metrics import confusion_matrix, ConfusionMatrixDisplay
 
 import tensorflow as tf
 from tensorflow.keras.models import Sequential
-from tensorflow.keras.layers import LSTM, Bidirectional, Dense, Dropout, Input
-from tensorflow.keras.utils import to_categorical
+from tensorflow.keras.layers import Conv2D, MaxPooling2D, Flatten, Dense, Dropout
+from tensorflow.keras.callbacks import EarlyStopping
 
-# Config
-DATASET_DIR = 'dataset'
-CATEGORIES = ['daisy', 'dandelion', 'rose', 'sunflower', 'tulip']
-IMG_SIZE = (64, 64)
-NUM_CLASSES = len(CATEGORIES)
-EPOCHS = 20
+IMG_HEIGHT = 128
+IMG_WIDTH = 128
 BATCH_SIZE = 32
+EPOCHS = 20
 
-os.makedirs('model', exist_ok=True)
-os.makedirs('outputs', exist_ok=True)
+def get_dataset_path():
+    paths = [
+        pathlib.Path('dataset') / 'flower_photos',
+        pathlib.Path.home() / '.keras' / 'datasets' / 'flower_photos',
+    ]
+    for p in paths:
+        if p.exists():
+            if (p / 'daisy').exists():
+                return p
+            elif (p / 'flower_photos' / 'daisy').exists():
+                return p / 'flower_photos'
 
-# 1. Load & Preprocess Images
-print("Loading images...")
-X, y = [], []
+    print("Downloading dataset...")
+    dataset_url = "https://storage.googleapis.com/download.tensorflow.org/example_images/flower_photos.tgz"
+    data_dir = tf.keras.utils.get_file('flower_photos', origin=dataset_url, untar=True)
+    p = pathlib.Path(data_dir)
+    return p / 'flower_photos' if (p / 'flower_photos').exists() else p
 
-for label_idx, category in enumerate(CATEGORIES):
-    folder_path = os.path.join(DATASET_DIR, category)
-    image_paths = glob.glob(os.path.join(folder_path, '*.jpg'))
+if __name__ == '__main__':
+    data_dir = get_dataset_path()
+    print(f"Loading data from: {data_dir.resolve()}")
+
+    # Load splits with explicit deterministic seed & alphabetical class indexing
+    train_ds = tf.keras.utils.image_dataset_from_directory(
+        data_dir,
+        validation_split=0.2,
+        subset="training",
+        seed=42,
+        image_size=(IMG_HEIGHT, IMG_WIDTH),
+        batch_size=BATCH_SIZE
+    )
+
+    val_ds = tf.keras.utils.image_dataset_from_directory(
+        data_dir,
+        validation_split=0.2,
+        subset="validation",
+        seed=42,
+        image_size=(IMG_HEIGHT, IMG_WIDTH),
+        batch_size=BATCH_SIZE
+    )
+
+    class_names = train_ds.class_names
+    print(f"Verified Class Order: {class_names}")
+
+    # Normalize pixels [0, 1] & optimize pipeline
+    normalization_layer = tf.keras.layers.Rescaling(1./255)
+    train_ds = train_ds.map(lambda x, y: (normalization_layer(x), y)).cache().prefetch(tf.data.AUTOTUNE)
+    val_ds = val_ds.map(lambda x, y: (normalization_layer(x), y)).cache().prefetch(tf.data.AUTOTUNE)
+
+    # Build reliable Convolutional Neural Network
+    model = Sequential([
+        Conv2D(32, (3, 3), activation='relu', input_shape=(IMG_HEIGHT, IMG_WIDTH, 3)),
+        MaxPooling2D((2, 2)),
+        Conv2D(64, (3, 3), activation='relu'),
+        MaxPooling2D((2, 2)),
+        Conv2D(128, (3, 3), activation='relu'),
+        MaxPooling2D((2, 2)),
+        Flatten(),
+        Dense(128, activation='relu'),
+        Dropout(0.5),
+        Dense(len(class_names), activation='softmax')
+    ])
+
+    model.compile(
+        optimizer='adam',
+        loss='sparse_categorical_crossentropy',
+        metrics=['accuracy']
+    )
+
+    model.summary()
+
+    early_stop = EarlyStopping(monitor='val_loss', patience=4, restore_best_weights=True)
+
+    history = model.fit(
+        train_ds,
+        validation_data=val_ds,
+        epochs=EPOCHS,
+        callbacks=[early_stop]
+    )
+
+    # Save Model Artifacts
+    os.makedirs('model', exist_ok=True)
+    os.makedirs('outputs', exist_ok=True)
     
-    for img_path in image_paths:
-        try:
-            img = Image.open(img_path).convert('RGB')
-            img = img.resize(IMG_SIZE)
-            img_array = np.array(img) / 255.0  # Normalize
-            
-            # Reshape into sequence (64 timesteps, 192 features)
-            sequence = img_array.reshape(IMG_SIZE[0], IMG_SIZE[1] * 3)
-            
-            X.append(sequence)
-            y.append(label_idx)
-        except Exception:
-            pass
+    model.save('model/flower_rnn.keras')
+    print("Model successfully saved to 'model/flower_rnn.keras'.")
 
-X = np.array(X, dtype=np.float32)
-y = np.array(y, dtype=np.int32)
-y_cat = to_categorical(y, num_classes=NUM_CLASSES)
+    # Evaluate Confusion Matrix
+    y_true, y_pred = [], []
+    for images, labels in val_ds:
+        preds = model.predict(images, verbose=0)
+        y_true.extend(labels.numpy())
+        y_pred.extend(np.argmax(preds, axis=1))
 
-# 2. Train / Test Split
-X_train, X_test, y_train, y_test = train_test_split(
-    X, y_cat, test_size=0.2, random_state=42, stratify=y
-)
-
-# 3. Build Bidirectional LSTM Model
-model = Sequential([
-    Input(shape=(64, 192)),
-    Bidirectional(LSTM(128, return_sequences=True)),
-    Dropout(0.3),
-    Bidirectional(LSTM(64)),
-    Dropout(0.3),
-    Dense(64, activation='relu'),
-    Dense(NUM_CLASSES, activation='softmax')
-])
-
-model.compile(
-    optimizer=tf.keras.optimizers.Adam(learning_rate=0.001),
-    loss='categorical_crossentropy',
-    metrics=['accuracy']
-)
-
-model.summary()
-
-# 4. Model Training
-print("\nTraining upgraded Bidirectional LSTM model...")
-history = model.fit(
-    X_train, y_train,
-    validation_data=(X_test, y_test),
-    epochs=EPOCHS,
-    batch_size=BATCH_SIZE
-)
-
-# 5. Save Model
-model_path = os.path.join('model', 'flower_rnn.keras')
-model.save(model_path)
-print(f"\nModel saved successfully at {model_path}")
-
-# 6. Evaluation Plots
-y_pred = model.predict(X_test)
-y_pred_classes = np.argmax(y_pred, axis=1)
-y_true_classes = np.argmax(y_test, axis=1)
-
-print("\nUpdated Classification Report:")
-print(classification_report(y_true_classes, y_pred_classes, target_names=CATEGORIES))
-
-# Plot Confusion Matrix
-cm = confusion_matrix(y_true_classes, y_pred_classes)
-disp = ConfusionMatrixDisplay(confusion_matrix=cm, display_labels=CATEGORIES)
-fig, ax = plt.subplots(figsize=(8, 6))
-disp.plot(cmap=plt.cm.Blues, ax=ax)
-plt.title("Bidirectional LSTM Flower Classification Confusion Matrix")
-plt.tight_layout()
-plt.savefig(os.path.join('outputs', 'confusion_matrix.png'))
-plt.close()
+    cm = confusion_matrix(y_true, y_pred)
+    fig, ax = plt.subplots(figsize=(7, 6))
+    disp = ConfusionMatrixDisplay(confusion_matrix=cm, display_labels=class_names)
+    disp.plot(ax=ax, cmap='Blues')
+    plt.title('Validation Confusion Matrix')
+    plt.tight_layout()
+    plt.savefig('outputs/confusion_matrix.png')
+    plt.close()
+    print("Confusion matrix saved to 'outputs/confusion_matrix.png'.")
